@@ -1,0 +1,126 @@
+name: build
+
+on:
+  workflow_dispatch: # lets you run a build from the UI
+  push:
+    branches: [ "main" ]
+  pull_request:
+
+env:
+  BUILD_TYPE: Release
+  BUILD_DIR: build
+  CCACHE_VERSION: 4.6
+  CCACHE_BASEDIR: ${GITHUB_WORKSPACE}
+  CCACHE_DIR: ${GITHUB_WORKSPACE}/.ccache
+  CCACHE_COMPRESS: true
+  CCACHE_COMPRESSLEVEL: 6
+  CCACHE_MAXSIZE: 400M
+  
+jobs:
+  build:
+    strategy:
+      fail-fast: false # show all errors for each platform (vs. cancel jobs on error)
+      matrix:
+        include:
+          - name: Linux
+            os: ubuntu-24.04
+            shared: OFF
+          - name: macOS
+            os: macos-14
+            shared: OFF
+          - name: Windows
+            os: windows-latest
+            shared: OFF
+          - name: Linux Shared
+            os: ubuntu-24.04
+            shared: ON
+          - name: macOS Shared
+            os: macos-14
+            shared: ON
+          - name: Windows Shared
+            os: windows-latest
+            shared: ON
+
+    runs-on: ${{ matrix.os }}
+    name: ${{ matrix.name }}
+
+    steps:
+
+      - name: 'Set up MSVC'
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Install Ninja (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: choco install ninja
+
+      - name: Install Ninja (macOS)
+        if: runner.os ==  'macOS'
+        run: brew install ninja
+
+      - name: Install Ninja (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build
+
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - name: Download ccache
+        id: ccache
+        shell: cmake -P {0}
+        run: |
+          set(ccache_url "https://github.com/cristianadam/ccache/releases/download/v$ENV{CCACHE_VERSION}/${{ runner.os }}.tar.xz")
+          file(DOWNLOAD "${ccache_url}" ./ccache.tar.xz SHOW_PROGRESS)
+          execute_process(COMMAND ${CMAKE_COMMAND} -E tar xvf ./ccache.tar.xz)
+
+      - name: Add ccache directory to GITHUB_PATH (NOT Windows)
+        if: runner.os != 'Windows'
+        run: echo "$(pwd)" >> $GITHUB_PATH
+      - name: Add ccache directory to GITHUB_PATH (Windows)
+        if: runner.os == 'Windows'
+        run: echo "${pwd}" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+      - name: Verify PATH (NOT Windows)
+        if: runner.os != 'Windows'
+        run: echo $PATH
+      - name: Verify PATH (Windows)
+        if: runner.os == 'Windows'
+        run: echo $env:PATH
+
+      - name: Prepare ccache timestamp
+        id: ccache_cache_timestamp
+        shell: cmake -P {0}
+        run: |
+          string(TIMESTAMP current_date "%Y%m%d-%H%M%S" UTC)
+          set(output_string "timestamp=${current_date}\n")
+          message(${output_string})
+          file(APPEND "$ENV{GITHUB_OUTPUT}" "${output_string}")
+      - name: Check timestamp var
+        shell: bash
+        run: echo ${{ steps.ccache_cache_timestamp.outputs.timestamp }}
+
+      - name: Cache build files with ccache
+        id: ccache_cache
+        uses: actions/cache@v4
+        with:
+          path: .ccache
+          key: ${{ matrix.config.name }}-ccache-${{ steps.ccache_cache_timestamp.outputs.timestamp }}
+          restore-keys: |
+            ${{ matrix.config.name }}-ccache-
+
+      - name: Configure
+        shell: bash
+        run: cmake -B ${{ env.BUILD_DIR }} -G Ninja -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }} -D CMAKE_C_COMPILER_LAUNCHER=ccache -D CMAKE_CXX_COMPILER_LAUNCHER=ccache -DBUILD_SHARED_LIBS="${{ matrix.shared }}" -DBUILD_TESTS="ON" -DCMAKE_OSX_ARCHITECTURES="arm64;x86_64" .
+
+      - name: Build
+        shell: bash
+        run: cmake --build ${{ env.BUILD_DIR }} --config ${{ env.BUILD_TYPE }} #--verbose
+
+      - name: Test
+        working-directory: ${{ env.BUILD_DIR }}
+        run: ctest --output-on-failure -j4 -VV
+
